@@ -1,4 +1,4 @@
-FROM node:22-bookworm@sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935
+FROM node:22-bookworm@sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935 AS openclaw
 
 # OCI base-image metadata for downstream image consumers.
 # If you change these annotations, also update:
@@ -128,6 +128,32 @@ USER node
 #   - GET /healthz (liveness) and GET /readyz (readiness)
 #   - aliases: /health and /ready
 # For external access from host/ingress, override bind to "lan" and set auth.
+HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
+
+FROM node:22-bookworm-slim AS lightweight
+
+RUN corepack enable
+
+WORKDIR /app
+RUN chown node:node /app
+
+USER node
+
+COPY --from=openclaw --chown=node:node /app/dist ./dist
+COPY --from=openclaw --chown=node:node /app/openclaw.mjs ./openclaw.mjs
+COPY --from=openclaw --chown=node:node /app/package.json ./package.json
+COPY --from=openclaw --chown=node:node /app/node_modules ./node_modules
+
+USER root
+RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
+ && chmod 755 /app/openclaw.mjs
+
+ENV NODE_ENV=production
+
+USER node
+
 HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]

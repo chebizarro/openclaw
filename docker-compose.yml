@@ -74,3 +74,83 @@ services:
     entrypoint: ["node", "dist/index.js"]
     depends_on:
       - openclaw-gateway
+
+  warden-agent:
+    image: ${WARDEN_IMAGE:-openclaw:lightweight}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: lightweight
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${WARDEN_GATEWAY_TOKEN:-}
+      OPENCLAW_ALLOW_INSECURE_PRIVATE_WS: ${OPENCLAW_ALLOW_INSECURE_PRIVATE_WS:-}
+      WARDEN_BUNKER_URL: ${WARDEN_BUNKER_URL:-ws://nak-bunker:7777}
+      WARDEN_RELAY_URL: ${WARDEN_RELAY_URL:-}
+      WARDEN_MAJORDOMO_NPUB: ${WARDEN_MAJORDOMO_NPUB:-}
+      WARDEN_NIP05_CONFIG_PATH: /config/nostr.json
+    networks:
+      - mini-internal
+    volumes:
+      - ${WARDEN_WORKSPACE_DIR:-./warden-workspace}:/workspace
+      - ${WARDEN_CONFIG_DIR:-./warden-config}:/config
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    init: true
+    restart: unless-stopped
+
+  nak-bunker:
+    image: ${NAK_BUNKER_IMAGE:-ghcr.io/fiatjaf/nak:latest}
+    networks:
+      - mini-internal
+    expose:
+      - "7777"
+    volumes:
+      - warden-keys:/keys
+      - ${WARDEN_CONFIG_DIR:-./warden-config}:/config:ro
+      - warden-bunker-logs:/logs
+    environment:
+      HOME: /tmp
+      TERM: xterm-256color
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    restart: unless-stopped
+
+  nip05-server:
+    image: ${NIP05_IMAGE:-nginx:stable-alpine}
+    networks:
+      - mini-internal
+    ports:
+      - "${NIP05_HTTP_PORT:-80}:80"
+      - "${NIP05_HTTPS_PORT:-443}:443"
+    volumes:
+      - ${WARDEN_CONFIG_DIR:-./warden-config}/.well-known:/usr/share/nginx/html/.well-known:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    restart: unless-stopped
+
+networks:
+  mini-internal:
+    driver: bridge
+
+
+volumes:
+  warden-keys:
+  warden-bunker-logs:
