@@ -23,9 +23,7 @@ type TrafficStatusSnapshot = {
 };
 
 type StoppableMonitor = {
-  // Allow async stop so implementors can await final I/O (e.g. flushing state
-  // to disk) before the lifecycle considers the account fully stopped.
-  stop: () => void | Promise<void>;
+  stop: () => void;
 };
 
 type RequireOpenAllowFromFn = (params: {
@@ -76,7 +74,7 @@ export async function runStoppablePassiveMonitor<TMonitor extends StoppableMonit
     abortSignal: params.abortSignal,
     start: params.start,
     stop: async (monitor) => {
-      await monitor.stop();
+      monitor.stop();
     },
   });
 }
