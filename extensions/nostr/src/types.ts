@@ -10,7 +10,7 @@ import {
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { normalizeSecretInputString, type SecretInput } from "openclaw/plugin-sdk/secret-input";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
-import type { NostrProfile } from "./config-schema.js";
+import type { NostrProfile, SoulFactoryBridgeConfig } from "./config-schema.js";
 import { DEFAULT_RELAYS } from "./default-relays.js";
 import { getPublicKeyFromPrivate } from "./nostr-key-utils.js";
 
@@ -23,6 +23,7 @@ interface NostrAccountConfig {
   dmPolicy?: "pairing" | "allowlist" | "open" | "disabled";
   allowFrom?: Array<string | number>;
   profile?: NostrProfile;
+  soulFactory?: SoulFactoryBridgeConfig;
 }
 
 export interface ResolvedNostrAccount {
@@ -34,6 +35,7 @@ export interface ResolvedNostrAccount {
   publicKey: string;
   relays: string[];
   profile?: NostrProfile;
+  soulFactory?: SoulFactoryBridgeConfig;
   config: NostrAccountConfig;
 }
 
@@ -104,6 +106,7 @@ export function resolveNostrAccount(opts: {
     publicKey,
     relays: nostrCfg?.relays ?? DEFAULT_RELAYS,
     profile: nostrCfg?.profile,
+    soulFactory: nostrCfg?.soulFactory,
     config: {
       enabled: nostrCfg?.enabled,
       name: nostrCfg?.name,
@@ -112,6 +115,7 @@ export function resolveNostrAccount(opts: {
       dmPolicy: nostrCfg?.dmPolicy,
       allowFrom: nostrCfg?.allowFrom,
       profile: nostrCfg?.profile,
+      soulFactory: nostrCfg?.soulFactory,
     },
   };
 }
