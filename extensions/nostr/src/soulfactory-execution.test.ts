@@ -12,8 +12,17 @@ const hoisted = vi.hoisted(() => {
   const spawnSessionDirectMock = vi.fn();
   const mutateConfigFileMock = vi.fn();
   const deleteSessionMock = vi.fn();
+  const imageGenerateMock = vi.fn();
+  const textToSpeechMock = vi.fn();
   const state = { cfg: { agents: { list: [] as Array<Record<string, unknown>> } } };
-  return { spawnSessionDirectMock, mutateConfigFileMock, deleteSessionMock, state };
+  return {
+    spawnSessionDirectMock,
+    mutateConfigFileMock,
+    deleteSessionMock,
+    imageGenerateMock,
+    textToSpeechMock,
+    state,
+  };
 });
 
 vi.mock("openclaw/plugin-sdk/sessions-spawn-runtime", () => ({
@@ -28,6 +37,12 @@ vi.mock("./runtime.js", () => ({
     },
     subagent: {
       deleteSession: hoisted.deleteSessionMock,
+    },
+    imageGeneration: {
+      generate: hoisted.imageGenerateMock,
+    },
+    tts: {
+      textToSpeech: hoisted.textToSpeechMock,
     },
   }),
 }));
@@ -70,6 +85,48 @@ function methodParams(method: SoulFactoryMethod): Record<string, unknown> {
   }
   if (method === "soulfactory.revoke") {
     return { reason: "operator request", revoke_runtime_credentials: true };
+  }
+  if (method === "soulfactory.avatar.generate") {
+    return { generation: { prompt: "pixel art owl", width: 512, height: 512 } };
+  }
+  if (method === "soulfactory.avatar.set") {
+    return { avatar: { current: "uploaded", uploaded_ref: "blossom:avatar-hash" } };
+  }
+  if (method === "soulfactory.voice.configure") {
+    return {
+      voice: {
+        provider: "elevenlabs",
+        persona_id: "scout-voice",
+        auto_mode: "tagged",
+        persona: { label: "Scout", profile: "Researcher", style: "clear" },
+      },
+    };
+  }
+  if (method === "soulfactory.voice.sample") {
+    return { sample_text: "Hello from Scout" };
+  }
+  if (method === "soulfactory.memory.configure") {
+    return {
+      memory: {
+        embedding_provider: "voyage",
+        embedding_model: "voyage-3",
+        auto_index: true,
+        search: { top_k: 8, score_threshold: 0.7, rerank: true },
+      },
+    };
+  }
+  if (method === "soulfactory.persona.update") {
+    return {
+      identity: { name: "Scout", theme: "warm", emoji: "🔍" },
+      persona: {
+        traits: ["curious", "patient"],
+        style: "conversational",
+        system_prompt_sections: { role: "You are Scout.", guidelines: "Cite sources." },
+      },
+    };
+  }
+  if (method === "soulfactory.config.reload") {
+    return { patch: { identity: { name: "Scout" } } };
   }
   return { reason: "operator request" };
 }
@@ -133,6 +190,21 @@ describe("SoulFactory OpenClaw execution", () => {
       runId: "run-1",
     });
     hoisted.deleteSessionMock.mockReset().mockResolvedValue(undefined);
+    hoisted.imageGenerateMock.mockReset().mockResolvedValue({
+      images: [{ buffer: Buffer.from("avatar"), mimeType: "image/png", fileName: "avatar.png" }],
+      provider: "test-image",
+      model: "test-model",
+      attempts: [],
+      ignoredOverrides: [],
+    });
+    hoisted.textToSpeechMock.mockReset().mockResolvedValue({
+      success: true,
+      audioPath: "/tmp/sample.mp3",
+      provider: "elevenlabs",
+      persona: "scout-voice",
+      latencyMs: 12,
+      outputFormat: "mp3",
+    });
     hoisted.mutateConfigFileMock
       .mockReset()
       .mockImplementation(
@@ -175,6 +247,21 @@ describe("SoulFactory OpenClaw execution", () => {
     });
   });
 
+  it("validates all customization runtime method envelopes", () => {
+    for (const method of [
+      "soulfactory.avatar.generate",
+      "soulfactory.avatar.set",
+      "soulfactory.voice.configure",
+      "soulfactory.voice.sample",
+      "soulfactory.memory.configure",
+      "soulfactory.memory.reindex",
+      "soulfactory.persona.update",
+      "soulfactory.config.reload",
+    ] as const) {
+      expect(validatedRequest(method).method).toBe(method);
+    }
+  });
+
   it("dispatches all documented lifecycle methods to config/session APIs", async () => {
     const { executeSoulFactoryRuntimeRequest } = await import("./soulfactory-execution.js");
     await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.provision"));
@@ -202,5 +289,100 @@ describe("SoulFactory OpenClaw execution", () => {
       specHash: "sha256:spec",
       lastRuntimeRequestEvent: expect.any(String),
     });
+  });
+
+  it("applies avatar and persona customization to managed agent config", async () => {
+    const { executeSoulFactoryRuntimeRequest } = await import("./soulfactory-execution.js");
+    await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.provision"));
+
+    const setOutcome = await executeSoulFactoryRuntimeRequest(
+      validatedRequest("soulfactory.avatar.set"),
+    );
+    expect(setOutcome.status).toBe("success");
+    expect(hoisted.state.cfg.agents.list[0]).toMatchObject({
+      identity: { avatar: "blossom:avatar-hash" },
+    });
+
+    const personaOutcome = await executeSoulFactoryRuntimeRequest(
+      validatedRequest("soulfactory.persona.update"),
+    );
+    expect(personaOutcome.status).toBe("success");
+    expect(hoisted.state.cfg.agents.list[0]).toMatchObject({
+      name: "Scout",
+      identity: { name: "Scout", theme: "warm", emoji: "🔍", avatar: "blossom:avatar-hash" },
+      systemPromptOverride: expect.stringContaining("You are Scout."),
+    });
+
+    const generateOutcome = await executeSoulFactoryRuntimeRequest(
+      validatedRequest("soulfactory.avatar.generate"),
+    );
+    expect(generateOutcome.status).toBe("success");
+    expect(hoisted.imageGenerateMock).toHaveBeenCalledWith(
+      expect.objectContaining({ prompt: "pixel art owl", size: "512x512", count: 1 }),
+    );
+    expect(hoisted.state.cfg.agents.list[0]).toMatchObject({
+      identity: { avatar: "data:image/png;base64,YXZhdGFy" },
+    });
+  });
+
+  it("configures TTS and memory search for managed agents", async () => {
+    const { executeSoulFactoryRuntimeRequest } = await import("./soulfactory-execution.js");
+    await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.provision"));
+
+    const voiceOutcome = await executeSoulFactoryRuntimeRequest(
+      validatedRequest("soulfactory.voice.configure"),
+    );
+    expect(voiceOutcome.status).toBe("success");
+    expect(hoisted.state.cfg.agents.list[0]).toMatchObject({
+      tts: {
+        provider: "elevenlabs",
+        persona: "scout-voice",
+        auto: "tagged",
+        personas: {
+          "scout-voice": {
+            label: "Scout",
+            prompt: { profile: "Researcher", style: "clear" },
+          },
+        },
+      },
+    });
+
+    const sampleOutcome = await executeSoulFactoryRuntimeRequest(
+      validatedRequest("soulfactory.voice.sample"),
+    );
+    expect(sampleOutcome.status).toBe("success");
+    expect(hoisted.textToSpeechMock).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "Hello from Scout", agentId: "agent-alice" }),
+    );
+
+    const memoryOutcome = await executeSoulFactoryRuntimeRequest(
+      validatedRequest("soulfactory.memory.configure"),
+    );
+    expect(memoryOutcome.status).toBe("success");
+    expect(hoisted.state.cfg.agents.list[0]).toMatchObject({
+      memorySearch: {
+        provider: "voyage",
+        model: "voyage-3",
+        sync: { onSessionStart: true, onSearch: true },
+        query: {
+          maxResults: 8,
+          minScore: 0.7,
+          hybrid: { mmr: { enabled: true } },
+        },
+      },
+    });
+  });
+
+  it("returns explicit not-implemented errors for pending customization hooks", async () => {
+    const { executeSoulFactoryRuntimeRequest } = await import("./soulfactory-execution.js");
+    await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.provision"));
+
+    for (const method of ["soulfactory.memory.reindex", "soulfactory.config.reload"] as const) {
+      const outcome = await executeSoulFactoryRuntimeRequest(validatedRequest(method));
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        error: { code: "execution_failed", retryable: false },
+      });
+    }
   });
 });

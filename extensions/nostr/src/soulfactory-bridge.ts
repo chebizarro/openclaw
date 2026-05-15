@@ -21,6 +21,14 @@ export const SOULFACTORY_METHODS = [
   "soulfactory.resume",
   "soulfactory.redeploy",
   "soulfactory.revoke",
+  "soulfactory.avatar.generate",
+  "soulfactory.avatar.set",
+  "soulfactory.voice.configure",
+  "soulfactory.voice.sample",
+  "soulfactory.memory.configure",
+  "soulfactory.memory.reindex",
+  "soulfactory.persona.update",
+  "soulfactory.config.reload",
 ] as const;
 
 export type SoulFactoryMethod = (typeof SOULFACTORY_METHODS)[number];
@@ -271,6 +279,41 @@ function hasObjectParam(params: Record<string, unknown>, name: string): boolean 
   return isObject(params[name]);
 }
 
+function hasNonEmptyStringParam(params: Record<string, unknown>, ...names: string[]): boolean {
+  return names.some((name) => typeof params[name] === "string" && Boolean(params[name].trim()));
+}
+
+function hasNestedObjectParam(params: Record<string, unknown>, ...path: string[]): boolean {
+  let cursor: unknown = params;
+  for (const segment of path) {
+    if (!isObject(cursor)) {
+      return false;
+    }
+    cursor = cursor[segment];
+  }
+  return isObject(cursor);
+}
+
+function hasNestedStringParam(params: Record<string, unknown>, ...path: string[]): boolean {
+  let cursor: unknown = params;
+  for (const segment of path) {
+    if (!isObject(cursor)) {
+      return false;
+    }
+    cursor = cursor[segment];
+  }
+  return typeof cursor === "string" && Boolean(cursor.trim());
+}
+
+function hasAvatarRefParam(params: Record<string, unknown>): boolean {
+  if (hasNonEmptyStringParam(params, "avatar_ref", "ref", "current_ref")) {
+    return true;
+  }
+  return ["generated_ref", "uploaded_ref", "avatar_ref", "ref", "current_ref"].some((name) =>
+    hasNestedStringParam(params, "avatar", name),
+  );
+}
+
 function validateMethodParams(
   envelope: SoulFactoryRequestEnvelope,
 ): SoulFactoryValidationResult | null {
@@ -344,6 +387,65 @@ function validateMethodParams(
           "missing_required_param",
           "revoke requires revoke_runtime_credentials boolean",
         );
+      }
+      return null;
+    case "soulfactory.avatar.generate":
+      if (
+        !hasNonEmptyStringParam(params, "prompt") &&
+        !hasNestedObjectParam(params, "generation") &&
+        !hasNestedObjectParam(params, "avatar", "generation")
+      ) {
+        return reject(
+          "missing_required_param",
+          "avatar.generate requires prompt or generation parameters",
+        );
+      }
+      return null;
+    case "soulfactory.avatar.set":
+      if (!hasAvatarRefParam(params)) {
+        return reject("missing_required_param", "avatar.set requires avatar_ref");
+      }
+      return null;
+    case "soulfactory.voice.configure":
+      if (
+        !isObject(params.voice) &&
+        !isObject(params.tts) &&
+        !hasNonEmptyStringParam(params, "provider")
+      ) {
+        return reject("missing_required_param", "voice.configure requires voice or tts parameters");
+      }
+      return null;
+    case "soulfactory.voice.sample":
+      if (!hasNonEmptyStringParam(params, "sample_text", "text")) {
+        return reject("missing_required_param", "voice.sample requires sample_text");
+      }
+      return null;
+    case "soulfactory.memory.configure":
+      if (
+        !isObject(params.memory) &&
+        !isObject(params.search) &&
+        !hasNonEmptyStringParam(params, "embedding_provider", "provider")
+      ) {
+        return reject("missing_required_param", "memory.configure requires memory parameters");
+      }
+      return null;
+    case "soulfactory.memory.reindex":
+      return null;
+    case "soulfactory.persona.update":
+      if (
+        !isObject(params.persona) &&
+        !isObject(params.identity) &&
+        !hasNonEmptyStringParam(params, "system_prompt", "systemPromptOverride")
+      ) {
+        return reject(
+          "missing_required_param",
+          "persona.update requires persona, identity, or system_prompt parameters",
+        );
+      }
+      return null;
+    case "soulfactory.config.reload":
+      if (!isObject(params.patch) && !isObject(params.resolved_spec)) {
+        return reject("missing_required_param", "config.reload requires patch or resolved_spec");
       }
       return null;
   }
