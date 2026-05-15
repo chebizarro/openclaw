@@ -12,6 +12,7 @@ export const SOULFACTORY_CONTROL_REQUEST_KIND = 38384;
 export const SOULFACTORY_CONTROL_RESULT_KIND = 38386;
 export const SOULFACTORY_RUNTIME = "openclaw";
 export const SOULFACTORY_CAPABILITY_SCHEMA = "soulfactory-runtime-capability/v1";
+export const SOULFACTORY_CAPABILITY_SCHEMA_VERSION = 1;
 export const SOULFACTORY_CONTROL_SCHEMA = "soulfactory-runtime-control/v1";
 
 export const SOULFACTORY_METHODS = [
@@ -32,6 +33,77 @@ export const SOULFACTORY_METHODS = [
 ] as const;
 
 export type SoulFactoryMethod = (typeof SOULFACTORY_METHODS)[number];
+export type SoulFactoryFeatureAvailability = "complete" | "partial" | "stubbed";
+
+export interface SoulFactoryCapabilityMethodMetadata {
+  availability: SoulFactoryFeatureAvailability;
+  category: "lifecycle" | "avatar" | "voice" | "memory" | "persona" | "config";
+}
+
+export const SOULFACTORY_METHOD_CAPABILITIES: Record<
+  SoulFactoryMethod,
+  SoulFactoryCapabilityMethodMetadata
+> = {
+  "soulfactory.provision": { availability: "complete", category: "lifecycle" },
+  "soulfactory.update": { availability: "complete", category: "lifecycle" },
+  "soulfactory.suspend": { availability: "complete", category: "lifecycle" },
+  "soulfactory.resume": { availability: "complete", category: "lifecycle" },
+  "soulfactory.redeploy": { availability: "complete", category: "lifecycle" },
+  "soulfactory.revoke": { availability: "complete", category: "lifecycle" },
+  "soulfactory.avatar.generate": { availability: "partial", category: "avatar" },
+  "soulfactory.avatar.set": { availability: "complete", category: "avatar" },
+  "soulfactory.voice.configure": { availability: "complete", category: "voice" },
+  "soulfactory.voice.sample": { availability: "partial", category: "voice" },
+  "soulfactory.memory.configure": { availability: "complete", category: "memory" },
+  "soulfactory.memory.reindex": { availability: "stubbed", category: "memory" },
+  "soulfactory.persona.update": { availability: "complete", category: "persona" },
+  "soulfactory.config.reload": { availability: "complete", category: "config" },
+};
+
+export const SOULFACTORY_CUSTOMIZATION_FEATURES = {
+  avatar: {
+    availability: "partial",
+    methods: ["soulfactory.avatar.generate", "soulfactory.avatar.set"],
+    providers: ["external", "blossom-ref"],
+  },
+  voice: {
+    availability: "partial",
+    methods: ["soulfactory.voice.configure", "soulfactory.voice.sample"],
+    providers: ["elevenlabs", "azure-speech", "tts-local-cli"],
+  },
+  memory: {
+    availability: "partial",
+    methods: ["soulfactory.memory.configure", "soulfactory.memory.reindex"],
+    providers: ["openai", "voyage", "memory-core", "memory-lancedb", "memory-wiki"],
+  },
+  persona: {
+    availability: "complete",
+    methods: ["soulfactory.persona.update", "soulfactory.config.reload"],
+    providers: ["openclaw-agent-defaults"],
+  },
+} as const satisfies Record<
+  string,
+  {
+    availability: SoulFactoryFeatureAvailability;
+    methods: readonly SoulFactoryMethod[];
+    providers: readonly string[];
+  }
+>;
+
+export const SOULFACTORY_PARITY = {
+  metiq: {
+    schema: SOULFACTORY_CAPABILITY_SCHEMA,
+    customization_methods: SOULFACTORY_METHODS.filter(
+      (method) =>
+        method.startsWith("soulfactory.avatar.") ||
+        method.startsWith("soulfactory.voice.") ||
+        method.startsWith("soulfactory.memory.") ||
+        method.startsWith("soulfactory.persona.") ||
+        method === "soulfactory.config.reload",
+    ),
+    metadata_fields: ["features", "method_capabilities", "feature_parity"],
+  },
+} as const;
 
 export type SoulFactoryResultErrorCode =
   | "invalid_schema"
@@ -725,8 +797,12 @@ export function createSoulFactoryCapabilityEvent(params: {
   const sk = validatePrivateKey(params.privateKey);
   const content = {
     schema: SOULFACTORY_CAPABILITY_SCHEMA,
+    schema_version: SOULFACTORY_CAPABILITY_SCHEMA_VERSION,
     runtime: SOULFACTORY_RUNTIME,
     methods: SOULFACTORY_METHODS,
+    method_capabilities: SOULFACTORY_METHOD_CAPABILITIES,
+    features: SOULFACTORY_CUSTOMIZATION_FEATURES,
+    feature_parity: SOULFACTORY_PARITY,
     control_schema: SOULFACTORY_CONTROL_SCHEMA,
     controller_pubkeys: normalizeControllerPubkeys(params.controllerPubkeys),
     relay_hints: {

@@ -5,10 +5,14 @@ import {
   type SoulFactoryBridgeStateStore,
   SOULFACTORY_CAPABILITY_KIND,
   SOULFACTORY_CAPABILITY_SCHEMA,
+  SOULFACTORY_CAPABILITY_SCHEMA_VERSION,
+  SOULFACTORY_CUSTOMIZATION_FEATURES,
   SOULFACTORY_CONTROL_REQUEST_KIND,
   SOULFACTORY_CONTROL_RESULT_KIND,
   SOULFACTORY_CONTROL_SCHEMA,
   SOULFACTORY_METHODS,
+  SOULFACTORY_METHOD_CAPABILITIES,
+  SOULFACTORY_PARITY,
   createSoulFactoryCapabilityEvent,
   createSoulFactoryResultEvent,
   createSoulFactoryRequestValidationState,
@@ -145,11 +149,40 @@ describe("SoulFactory OpenClaw bridge", () => {
     const content = JSON.parse(event.content) as Record<string, unknown>;
     expect(content).toMatchObject({
       schema: SOULFACTORY_CAPABILITY_SCHEMA,
+      schema_version: SOULFACTORY_CAPABILITY_SCHEMA_VERSION,
       runtime: "openclaw",
       control_schema: SOULFACTORY_CONTROL_SCHEMA,
       controller_pubkeys: [CONTROLLER_PUBKEY],
+      method_capabilities: SOULFACTORY_METHOD_CAPABILITIES,
+      features: SOULFACTORY_CUSTOMIZATION_FEATURES,
+      feature_parity: SOULFACTORY_PARITY,
     });
     expect(content.methods).toEqual(SOULFACTORY_METHODS);
+    expect(content.features).toMatchObject({
+      avatar: {
+        availability: "partial",
+        methods: ["soulfactory.avatar.generate", "soulfactory.avatar.set"],
+      },
+      memory: {
+        availability: "partial",
+        methods: ["soulfactory.memory.configure", "soulfactory.memory.reindex"],
+      },
+    });
+    expect(content.method_capabilities).toMatchObject({
+      "soulfactory.persona.update": { availability: "complete", category: "persona" },
+      "soulfactory.memory.reindex": { availability: "stubbed", category: "memory" },
+    });
+    expect(content.feature_parity).toMatchObject({
+      metiq: {
+        customization_methods: expect.arrayContaining([
+          "soulfactory.avatar.generate",
+          "soulfactory.voice.configure",
+          "soulfactory.memory.configure",
+          "soulfactory.persona.update",
+          "soulfactory.config.reload",
+        ]),
+      },
+    });
   });
 
   it("publishes capability and subscribes to addressed 38384 requests", async () => {
