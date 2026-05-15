@@ -81,6 +81,41 @@ function cloneRecord(value: unknown): Record<string, unknown> | undefined {
   return isRecord(value) ? structuredClone(value) : undefined;
 }
 
+function hasRecordParam(params: Record<string, unknown>, ...keys: string[]): boolean {
+  return keys.some((key) => isRecord(params[key]));
+}
+
+function hasOwnParam(params: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(params, key);
+}
+
+function hasAnyParam(params: Record<string, unknown>, ...keys: string[]): boolean {
+  return keys.some((key) => params[key] !== undefined);
+}
+
+function hasAnyOwnParam(params: Record<string, unknown>, ...keys: string[]): boolean {
+  return keys.some((key) => hasOwnParam(params, key));
+}
+
+function mergeRecordPatch(
+  base: Record<string, unknown> | undefined,
+  patch: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!base && !patch) {
+    return undefined;
+  }
+  const next: Record<string, unknown> = { ...(base ? structuredClone(base) : {}) };
+  for (const [key, value] of Object.entries(patch ?? {})) {
+    const existing = next[key];
+    if (isRecord(existing) && isRecord(value)) {
+      next[key] = mergeRecordPatch(existing, value);
+    } else {
+      next[key] = structuredClone(value);
+    }
+  }
+  return next;
+}
+
 function normalizeAgentId(value: string): string {
   const normalized = value
     .trim()
@@ -146,13 +181,15 @@ function upsertManagedAgent(
   const list = cfg.agents.list as ManagedAgentEntry[];
   const index = list.findIndex((entry) => normalizeAgentId(entry.id) === normalized);
   const existing = index >= 0 ? list[index] : ({ id: normalized } satisfies ManagedAgentEntry);
-  const identity =
-    existing.identity || patch.identity
+  const patchHasIdentity = hasOwnParam(patch as Record<string, unknown>, "identity");
+  const identity = patchHasIdentity
+    ? patch.identity
       ? {
           ...existing.identity,
           ...patch.identity,
         }
-      : undefined;
+      : undefined
+    : existing.identity;
   const next: ManagedAgentEntry = {
     ...existing,
     ...patch,
@@ -166,6 +203,11 @@ function upsertManagedAgent(
   };
   if (!next.identity?.name) {
     delete next.identity;
+  }
+  for (const key of ["tts", "memorySearch", "systemPromptOverride"] as const) {
+    if (next[key] === undefined) {
+      delete next[key];
+    }
   }
   if (index >= 0) {
     list[index] = next;
@@ -790,10 +832,8 @@ function buildVoiceTtsConfig(
   const provider = firstString(raw.provider, params.provider);
   const personaId = firstString(raw.persona_id, raw.personaId, raw.persona);
   const auto = firstString(raw.auto_mode, raw.auto, params.auto_mode);
-  const next: Record<string, unknown> = {
-    ...cloneRecord(current.tts),
-    ...cloneRecord(params.tts),
-  };
+  const next: Record<string, unknown> =
+    mergeRecordPatch(cloneRecord(current.tts), cloneRecord(params.tts)) ?? {};
   if (provider) {
     next.provider = provider;
   }
@@ -896,9 +936,11 @@ function buildMemorySearchConfig(
   current: ManagedAgentEntry,
   params: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
-  const raw = readRecord(params.memory) ?? params;
+  const directMemorySearch = cloneRecord(params.memorySearch);
+  const raw = readRecord(params.memory) ?? directMemorySearch ?? params;
   const search = readRecord(raw.search) ?? readRecord(params.search);
-  const next: Record<string, unknown> = { ...cloneRecord(current.memorySearch) };
+  const next: Record<string, unknown> =
+    mergeRecordPatch(cloneRecord(current.memorySearch), directMemorySearch) ?? {};
   const provider = firstString(
     raw.embedding_provider,
     raw.provider,
@@ -967,6 +1009,128 @@ async function executeMemoryConfigure(
   };
 }
 
+function resolveConfigReloadParams(
+  params: Record<string, unknown>,
+): { params: Record<string, unknown>; mode: "patch" | "replace" } | undefined {
+  const resolvedSpec = cloneRecord(params.resolved_spec) ?? cloneRecord(params.resolvedSpec);
+  const patch = cloneRecord(params.patch);
+  const merged = mergeRecordPatch(resolvedSpec, patch);
+  if (!merged || Object.keys(merged).length === 0) {
+    return undefined;
+  }
+  return { params: merged, mode: resolvedSpec ? "replace" : "patch" };
+}
+
+function buildConfigReloadPatch(
+  current: ManagedAgentEntry,
+  params: Record<string, unknown>,
+  mode: "patch" | "replace",
+): { patch: Partial<ManagedAgentEntry>; applied: string[] } {
+  const patch: Partial<ManagedAgentEntry> = {};
+  const applied: string[] = [];
+
+  const hasTtsPatch =
+    hasRecordParam(params, "tts", "voice") ||
+    hasAnyOwnParam(params, "tts", "voice") ||
+    hasAnyParam(params, "provider", "persona_id", "personaId", "auto_mode");
+  if (hasTtsPatch) {
+    const tts =
+      params.tts === null || params.voice === null
+        ? undefined
+        : buildVoiceTtsConfig(
+            mode === "replace" ? { ...current, tts: undefined } : current,
+            params,
+          );
+    patch.tts = tts;
+    applied.push("tts");
+  } else if (mode === "replace" && current.tts) {
+    patch.tts = undefined;
+    applied.push("tts");
+  }
+
+  const hasMemoryPatch =
+    hasRecordParam(params, "memory", "memorySearch", "search") ||
+    hasAnyOwnParam(params, "memory", "memorySearch", "search") ||
+    hasAnyParam(params, "embedding_provider", "embedding_model");
+  if (hasMemoryPatch) {
+    const memorySearch =
+      params.memory === null || params.memorySearch === null
+        ? undefined
+        : buildMemorySearchConfig(
+            mode === "replace" ? { ...current, memorySearch: undefined } : current,
+            params,
+          );
+    patch.memorySearch = memorySearch;
+    applied.push("memorySearch");
+  } else if (mode === "replace" && current.memorySearch) {
+    patch.memorySearch = undefined;
+    applied.push("memorySearch");
+  }
+
+  const identity = readIdentityPatch(params);
+  if (identity) {
+    patch.identity = mode === "replace" ? identity : { ...current.identity, ...identity };
+    if (identity.name) {
+      patch.name = identity.name;
+    }
+    applied.push("identity");
+  }
+
+  const hasSystemPromptPatch =
+    hasAnyOwnParam(params, "system_prompt", "systemPromptOverride", "persona") ||
+    hasRecordParam(params, "persona");
+  const systemPromptOverride = buildPersonaSystemPrompt(params);
+  if (systemPromptOverride) {
+    patch.systemPromptOverride = systemPromptOverride;
+    applied.push("systemPromptOverride");
+  } else if (
+    (mode === "replace" && current.systemPromptOverride) ||
+    (hasSystemPromptPatch &&
+      (params.system_prompt === null ||
+        params.systemPromptOverride === null ||
+        params.persona === null))
+  ) {
+    patch.systemPromptOverride = undefined;
+    applied.push("systemPromptOverride");
+  }
+
+  return { patch, applied };
+}
+
+async function executeConfigReload(
+  request: ValidatedSoulFactoryRequest,
+): Promise<SoulFactoryExecutionOutcome> {
+  const current = getManagedAgent(request);
+  if (!current) {
+    return managedAgentUnavailable(request);
+  }
+  const reload = resolveConfigReloadParams(request.envelope.params);
+  if (!reload) {
+    return rejected("missing_required_param", "config.reload requires patch or resolved_spec");
+  }
+  const { patch, applied } = buildConfigReloadPatch(current, reload.params, reload.mode);
+  if (applied.length === 0) {
+    return rejected(
+      "missing_required_param",
+      "config.reload patch did not contain supported tts, memorySearch, identity, or systemPromptOverride changes",
+    );
+  }
+  const entry = await persistCustomizationPatch({ request, current, patch });
+  return {
+    status: "success",
+    result: {
+      ...resultFor({ request, state: entry.soulFactory?.state ?? "running" }),
+      applied,
+      session_restarted: false,
+      ...(patch.tts ? { tts: patch.tts } : {}),
+      ...(patch.memorySearch ? { memory_search: patch.memorySearch } : {}),
+      ...(entry.identity ? { identity: entry.identity } : {}),
+      system_prompt_updated: applied.includes("systemPromptOverride"),
+    },
+    error: null,
+  };
+}
+
 export async function executeSoulFactoryRuntimeRequest(
   request: ValidatedSoulFactoryRequest,
 ): Promise<SoulFactoryExecutionOutcome> {
@@ -984,7 +1148,7 @@ export async function executeSoulFactoryRuntimeRequest(
     "soulfactory.memory.configure": () => executeMemoryConfigure(request),
     "soulfactory.memory.reindex": async () => notImplemented(request.method),
     "soulfactory.persona.update": () => executePersonaUpdate(request),
-    "soulfactory.config.reload": async () => notImplemented(request.method),
+    "soulfactory.config.reload": () => executeConfigReload(request),
   };
   return await handlers[request.method]();
 }

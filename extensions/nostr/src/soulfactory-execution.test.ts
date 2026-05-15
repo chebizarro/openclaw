@@ -126,12 +126,27 @@ function methodParams(method: SoulFactoryMethod): Record<string, unknown> {
     };
   }
   if (method === "soulfactory.config.reload") {
-    return { patch: { identity: { name: "Scout" } } };
+    return {
+      patch: {
+        identity: { name: "Scout Live", theme: "ocean", emoji: "🦀" },
+        systemPromptOverride: "You are Scout Live.",
+        tts: {
+          provider: "elevenlabs",
+          persona: "scout-live-voice",
+          auto: "always",
+        },
+        memorySearch: {
+          provider: "openai",
+          model: "text-embedding-3-small",
+          query: { maxResults: 12, minScore: 0.62 },
+        },
+      },
+    };
   }
   return { reason: "operator request" };
 }
 
-function createRequest(method: SoulFactoryMethod): Event {
+function createRequest(method: SoulFactoryMethod, params = methodParams(method)): Event {
   const idempotencyKey = `idem-${method}`;
   const specHash = method === "soulfactory.update" ? "sha256:spec2" : "sha256:spec";
   const operatorRequest = `operator-${method}`;
@@ -144,7 +159,7 @@ function createRequest(method: SoulFactoryMethod): Event {
     controller: { pubkey: CONTROLLER_PUBKEY },
     target: { runtime: "openclaw", runtime_pubkey: RUNTIME_PUBKEY, agent_id: "agent-alice" },
     soul: { id: "soul-alice", draft: "draft-event", spec_hash: specHash },
-    params: methodParams(method),
+    params,
   };
   return finalizeEvent(
     {
@@ -167,9 +182,9 @@ function createRequest(method: SoulFactoryMethod): Event {
   );
 }
 
-function validatedRequest(method: SoulFactoryMethod) {
+function validatedRequest(method: SoulFactoryMethod, params?: Record<string, unknown>) {
   const result = validateSoulFactoryControlRequest({
-    event: createRequest(method),
+    event: createRequest(method, params),
     runtimePubkey: RUNTIME_PUBKEY,
     trustedControllerPubkeys: [CONTROLLER_PUBKEY],
     now: NOW,
@@ -323,9 +338,11 @@ describe("SoulFactory OpenClaw execution", () => {
     expect(hoisted.state.cfg.agents.list[0]).toMatchObject({
       identity: { avatar: "data:image/png;base64,YXZhdGFy" },
     });
+    expect(hoisted.spawnSessionDirectMock).toHaveBeenCalledTimes(1);
+    expect(hoisted.deleteSessionMock).not.toHaveBeenCalled();
   });
 
-  it("configures TTS and memory search for managed agents", async () => {
+  it("configures TTS and memory search for managed agents without restarting sessions", async () => {
     const { executeSoulFactoryRuntimeRequest } = await import("./soulfactory-execution.js");
     await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.provision"));
 
@@ -371,13 +388,86 @@ describe("SoulFactory OpenClaw execution", () => {
         },
       },
     });
+    expect(hoisted.spawnSessionDirectMock).toHaveBeenCalledTimes(1);
+    expect(hoisted.deleteSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("hot-reloads TTS, memory, system prompt, and identity config without restarting sessions", async () => {
+    const { executeSoulFactoryRuntimeRequest } = await import("./soulfactory-execution.js");
+    await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.provision"));
+
+    const outcome = await executeSoulFactoryRuntimeRequest(
+      validatedRequest("soulfactory.config.reload"),
+    );
+
+    expect(outcome).toMatchObject({
+      status: "success",
+      result: {
+        applied: ["tts", "memorySearch", "identity", "systemPromptOverride"],
+        session_restarted: false,
+      },
+    });
+    expect(hoisted.state.cfg.agents.list[0]).toMatchObject({
+      name: "Scout Live",
+      identity: { name: "Scout Live", theme: "ocean", emoji: "🦀" },
+      systemPromptOverride: "You are Scout Live.",
+      tts: {
+        provider: "elevenlabs",
+        persona: "scout-live-voice",
+        auto: "always",
+      },
+      memorySearch: {
+        provider: "openai",
+        model: "text-embedding-3-small",
+        query: { maxResults: 12, minScore: 0.62 },
+      },
+    });
+    expect(hoisted.spawnSessionDirectMock).toHaveBeenCalledTimes(1);
+    expect(hoisted.deleteSessionMock).not.toHaveBeenCalled();
+    expect(hoisted.mutateConfigFileMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ afterWrite: { mode: "auto" } }),
+    );
+  });
+
+  it("syncs resolved config reload specs by clearing stale optional customization config", async () => {
+    const { executeSoulFactoryRuntimeRequest } = await import("./soulfactory-execution.js");
+    await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.provision"));
+    await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.voice.configure"));
+    await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.memory.configure"));
+    await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.persona.update"));
+
+    const outcome = await executeSoulFactoryRuntimeRequest(
+      validatedRequest("soulfactory.config.reload", {
+        resolved_spec: {
+          identity: { name: "Scout Minimal", theme: "plain", emoji: "•" },
+        },
+      }),
+    );
+
+    expect(outcome).toMatchObject({
+      status: "success",
+      result: {
+        applied: ["tts", "memorySearch", "identity", "systemPromptOverride"],
+        session_restarted: false,
+      },
+    });
+    const agent = hoisted.state.cfg.agents.list[0];
+    expect(agent).toMatchObject({
+      name: "Scout Minimal",
+      identity: { name: "Scout Minimal", theme: "plain", emoji: "•" },
+    });
+    expect(agent).not.toHaveProperty("tts");
+    expect(agent).not.toHaveProperty("memorySearch");
+    expect(agent).not.toHaveProperty("systemPromptOverride");
+    expect(hoisted.spawnSessionDirectMock).toHaveBeenCalledTimes(1);
+    expect(hoisted.deleteSessionMock).not.toHaveBeenCalled();
   });
 
   it("returns explicit not-implemented errors for pending customization hooks", async () => {
     const { executeSoulFactoryRuntimeRequest } = await import("./soulfactory-execution.js");
     await executeSoulFactoryRuntimeRequest(validatedRequest("soulfactory.provision"));
 
-    for (const method of ["soulfactory.memory.reindex", "soulfactory.config.reload"] as const) {
+    for (const method of ["soulfactory.memory.reindex"] as const) {
       const outcome = await executeSoulFactoryRuntimeRequest(validatedRequest(method));
       expect(outcome).toMatchObject({
         status: "rejected",
