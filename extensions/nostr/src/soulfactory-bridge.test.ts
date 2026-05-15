@@ -6,12 +6,15 @@ import {
   SOULFACTORY_CAPABILITY_KIND,
   SOULFACTORY_CAPABILITY_SCHEMA,
   SOULFACTORY_CONTROL_REQUEST_KIND,
+  SOULFACTORY_CONTROL_RESULT_KIND,
   SOULFACTORY_CONTROL_SCHEMA,
   SOULFACTORY_METHODS,
   createSoulFactoryCapabilityEvent,
+  createSoulFactoryResultEvent,
   createSoulFactoryRequestValidationState,
   startSoulFactoryBridge,
   validateSoulFactoryControlRequest,
+  type ValidatedSoulFactoryRequest,
 } from "./soulfactory-bridge.js";
 import { TEST_HEX_PRIVATE_KEY, TEST_RELAY_URL } from "./test-fixtures.js";
 
@@ -99,6 +102,22 @@ function createMemoryStateStore(seed?: Awaited<ReturnType<SoulFactoryBridgeState
   return store;
 }
 
+type CapturedBridgeHandlers = { onevent: (event: Event) => void | Promise<void> };
+
+async function dispatchCapturedEvent(
+  handlers: CapturedBridgeHandlers | null,
+  event: Event,
+): Promise<void> {
+  if (!handlers) {
+    throw new Error("expected SoulFactory bridge subscription handlers");
+  }
+  await handlers.onevent(event);
+}
+
+function publishCallsOf(pool: { publish: ReturnType<typeof vi.fn> }): Array<[string[], Event]> {
+  return pool.publish.mock.calls as Array<[string[], Event]>;
+}
+
 function validate(event: Event) {
   return validateSoulFactoryControlRequest({
     event,
@@ -170,7 +189,10 @@ describe("SoulFactory OpenClaw bridge", () => {
       expect.any(Object),
     );
 
-    await handlers?.onevent(createRequest({ createdAt: Math.floor(Date.now() / 1000) }));
+    await dispatchCapturedEvent(
+      handlers,
+      createRequest({ createdAt: Math.floor(Date.now() / 1000) }),
+    );
     expect(stateStore.write).toHaveBeenCalledWith(
       expect.objectContaining({
         accountId: "default",
@@ -178,6 +200,159 @@ describe("SoulFactory OpenClaw bridge", () => {
       }),
     );
     expect(onValidatedRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("creates signed 38386 runtime control results", () => {
+    const state = createSoulFactoryRequestValidationState();
+    const validation = validateSoulFactoryControlRequest({
+      event: createRequest(),
+      runtimePubkey: RUNTIME_PUBKEY,
+      trustedControllerPubkeys: [CONTROLLER_PUBKEY],
+      now: NOW,
+      state,
+    });
+    expect(validation.ok).toBe(true);
+    if (!validation.ok) {
+      throw new Error("expected validation success");
+    }
+
+    const event = createSoulFactoryResultEvent({
+      privateKey: RUNTIME_PRIVATE_KEY,
+      request: validation.request,
+      outcome: {
+        status: "success",
+        result: {
+          agent_id: validation.request.agentId,
+          runtime: "openclaw",
+          runtime_binding: `openclaw://agents/${validation.request.agentId}`,
+          state: "running",
+          spec_hash: validation.request.specHash,
+          observed_at: NOW,
+          warnings: [],
+        },
+        error: null,
+      },
+      createdAt: NOW,
+    });
+
+    expect(event.kind).toBe(SOULFACTORY_CONTROL_RESULT_KIND);
+    expect(verifyEvent(event)).toBe(true);
+    expect(event.pubkey).toBe(RUNTIME_PUBKEY);
+    expect(event.tags).toContainEqual(["e", validation.request.event.id]);
+    expect(event.tags).toContainEqual(["method", "soulfactory.provision"]);
+    expect(event.tags).toContainEqual(["status", "success"]);
+    const content = JSON.parse(event.content) as Record<string, unknown>;
+    expect(content).toMatchObject({
+      schema: SOULFACTORY_CONTROL_SCHEMA,
+      method: "soulfactory.provision",
+      idempotency_key: validation.request.idempotencyKey,
+      request_event: validation.request.event.id,
+      operator_request_event: validation.request.operatorRequestEvent,
+      status: "success",
+      error: null,
+    });
+  });
+
+  it("executes validated requests and publishes correlated 38386 results", async () => {
+    let handlers: { onevent: (event: Event) => void | Promise<void> } | null = null;
+    const pool = {
+      publish: vi.fn(() => [Promise.resolve()]),
+      subscribeMany: vi.fn((_relays, _filters, nextHandlers) => {
+        handlers = nextHandlers;
+        return { close: vi.fn() };
+      }),
+    };
+    const requestEvent = createRequest({ createdAt: Math.floor(Date.now() / 1000) });
+    const executeRequest = vi.fn(async (request: ValidatedSoulFactoryRequest) => ({
+      status: "success" as const,
+      result: {
+        agent_id: request.agentId,
+        runtime: "openclaw",
+        runtime_binding: `openclaw://agents/${request.agentId}`,
+        state: "running",
+        spec_hash: request.specHash,
+        observed_at: NOW,
+        warnings: [],
+      },
+      error: null,
+    }));
+    const onResultPublished = vi.fn();
+
+    await startSoulFactoryBridge({
+      accountId: "default",
+      privateKey: RUNTIME_PRIVATE_KEY,
+      relays: [TEST_RELAY_URL],
+      config: { enabled: true, controllerPubkeys: [CONTROLLER_PUBKEY] },
+      pool,
+      stateStore: createMemoryStateStore(),
+      executeRequest,
+      onResultPublished,
+    });
+
+    await dispatchCapturedEvent(handlers, requestEvent);
+
+    expect(executeRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ event: requestEvent, method: "soulfactory.provision" }),
+    );
+    expect(pool.publish).toHaveBeenCalledWith(
+      [TEST_RELAY_URL],
+      expect.objectContaining({ kind: SOULFACTORY_CONTROL_RESULT_KIND }),
+    );
+    const resultEvent = publishCallsOf(pool).find(
+      (call) => call[1].kind === SOULFACTORY_CONTROL_RESULT_KIND,
+    )?.[1];
+    expect(resultEvent).toBeDefined();
+    expect(resultEvent?.tags).toContainEqual(["e", requestEvent.id]);
+    expect(onResultPublished).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: expect.objectContaining({ kind: SOULFACTORY_CONTROL_RESULT_KIND }),
+      }),
+    );
+  });
+
+  it("does not persist idempotency state when result publication fails", async () => {
+    let handlers: { onevent: (event: Event) => void | Promise<void> } | null = null;
+    const pool = {
+      publish: vi.fn((_relays: string[], event: Event) => [
+        event.kind === SOULFACTORY_CONTROL_RESULT_KIND
+          ? Promise.reject(new Error("relay down"))
+          : Promise.resolve(),
+      ]),
+      subscribeMany: vi.fn((_relays, _filters, nextHandlers) => {
+        handlers = nextHandlers;
+        return { close: vi.fn() };
+      }),
+    };
+    const stateStore = createMemoryStateStore();
+    const executeRequest = vi.fn(async () => ({
+      status: "success" as const,
+      result: {},
+      error: null,
+    }));
+    const onError = vi.fn();
+
+    await startSoulFactoryBridge({
+      accountId: "default",
+      privateKey: RUNTIME_PRIVATE_KEY,
+      relays: [TEST_RELAY_URL],
+      config: { enabled: true, controllerPubkeys: [CONTROLLER_PUBKEY] },
+      pool,
+      stateStore,
+      executeRequest,
+      onError,
+    });
+
+    await dispatchCapturedEvent(
+      handlers,
+      createRequest({ createdAt: Math.floor(Date.now() / 1000) }),
+    );
+
+    expect(executeRequest).toHaveBeenCalledTimes(1);
+    expect(stateStore.write).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      expect.any(Error),
+      "soulfactory result publish or persist",
+    );
   });
 
   it("seeds persisted request IDs and idempotency keys before validation", () => {
@@ -267,6 +442,43 @@ describe("SoulFactory OpenClaw bridge", () => {
     expect(validate(misaddressed)).toMatchObject({ ok: false, code: "misaddressed_request" });
   });
 
+  it("publishes rejected 38386 results for signed, addressed validation failures", async () => {
+    let handlers: { onevent: (event: Event) => void | Promise<void> } | null = null;
+    const pool = {
+      publish: vi.fn(() => [Promise.resolve()]),
+      subscribeMany: vi.fn((_relays, _filters, nextHandlers) => {
+        handlers = nextHandlers;
+        return { close: vi.fn() };
+      }),
+    };
+    await startSoulFactoryBridge({
+      accountId: "default",
+      privateKey: RUNTIME_PRIVATE_KEY,
+      relays: [TEST_RELAY_URL],
+      config: { enabled: true, controllerPubkeys: [CONTROLLER_PUBKEY] },
+      pool,
+      stateStore: createMemoryStateStore(),
+    });
+
+    await dispatchCapturedEvent(
+      handlers,
+      createRequest({
+        privateKey: UNTRUSTED_PRIVATE_KEY,
+        createdAt: Math.floor(Date.now() / 1000),
+      }),
+    );
+
+    const resultEvent = publishCallsOf(pool).find(
+      (call) => call[1].kind === SOULFACTORY_CONTROL_RESULT_KIND,
+    )?.[1];
+    expect(resultEvent).toBeDefined();
+    expect(resultEvent?.tags).toContainEqual(["status", "rejected"]);
+    expect(resultEvent?.tags).toContainEqual(["p", UNTRUSTED_PUBKEY]);
+    const content = JSON.parse(resultEvent?.content ?? "{}") as Record<string, unknown>;
+    expect(content).toMatchObject({ status: "rejected" });
+    expect(content.error).toMatchObject({ code: "unauthorized_controller" });
+  });
+
   it("does not dispatch validation callback for rejected requests", async () => {
     let handlers: { onevent: (event: Event) => void | Promise<void> } | null = null;
     const pool = {
@@ -289,7 +501,8 @@ describe("SoulFactory OpenClaw bridge", () => {
       onRejectedRequest,
     });
 
-    await handlers?.onevent(
+    await dispatchCapturedEvent(
+      handlers,
       createRequest({
         privateKey: UNTRUSTED_PRIVATE_KEY,
         createdAt: Math.floor(Date.now() / 1000),

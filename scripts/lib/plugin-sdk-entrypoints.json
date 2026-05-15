@@ -83,6 +83,7 @@
   "text-runtime",
   "text-chunking",
   "agent-runtime",
+  "sessions-spawn-runtime",
   "simple-completion-runtime",
   "speech-core",
   "tts-runtime",

@@ -38,6 +38,42 @@ export type AgentRuntimeConfig =
       acp?: AgentRuntimeAcpConfig;
     };
 
+export type AgentSoulFactoryConfig = {
+  /** Marks this OpenClaw agent as managed by a SoulFactory runtime controller. */
+  managed?: boolean;
+  /** Soul id or 31951 coordinate used by Bahia/SoulFactory. */
+  soulId?: string;
+  /** Last known 31951 soul read-model event id. */
+  soulEvent?: string;
+  /** Exact 31952 draft event id captured for the active spec. */
+  soulDraft?: string;
+  /** Operator/user pubkey that requested the current binding. */
+  ownerPubkey?: string;
+  /** Trusted SoulFactory controller pubkey that issued the runtime request. */
+  controllerPubkey?: string;
+  /** Runtime pubkey that accepted the SoulFactory control request. */
+  runtimePubkey?: string;
+  /** Capability event id or coordinate selected by SoulFactory. */
+  capabilityRef?: string;
+  /** Control relay hints used for this managed binding. */
+  controlRelays?: string[];
+  /** Resolved desired-spec hash for the active binding. */
+  specHash?: string;
+  /** Last operator-facing request event id (5950 or 1950). */
+  lastOperatorRequestEvent?: string;
+  /** Last runtime-facing 38384 request event id. */
+  lastRuntimeRequestEvent?: string;
+  /** Runtime binding URI reported back to SoulFactory. */
+  runtimeBinding?: string;
+  state?: "running" | "suspended" | "revoked" | "failed";
+  session?: {
+    key?: string;
+    runId?: string;
+    spawnedAt?: number;
+  };
+  updatedAt?: number;
+};
+
 export type AgentBindingMatch = {
   channel: string;
   accountId?: string;
@@ -138,6 +174,8 @@ export type AgentConfig = {
   tools?: AgentToolsConfig;
   /** Optional runtime descriptor for this agent. */
   runtime?: AgentRuntimeConfig;
+  /** Optional SoulFactory management metadata for runtime-provisioned agents. */
+  soulFactory?: AgentSoulFactoryConfig;
 };
 
 export type AgentsConfig = {

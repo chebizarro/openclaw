@@ -9,6 +9,7 @@ import {
 
 export const SOULFACTORY_CAPABILITY_KIND = 30317;
 export const SOULFACTORY_CONTROL_REQUEST_KIND = 38384;
+export const SOULFACTORY_CONTROL_RESULT_KIND = 38386;
 export const SOULFACTORY_RUNTIME = "openclaw";
 export const SOULFACTORY_CAPABILITY_SCHEMA = "soulfactory-runtime-capability/v1";
 export const SOULFACTORY_CONTROL_SCHEMA = "soulfactory-runtime-control/v1";
@@ -23,6 +24,22 @@ export const SOULFACTORY_METHODS = [
 ] as const;
 
 export type SoulFactoryMethod = (typeof SOULFACTORY_METHODS)[number];
+
+export type SoulFactoryResultErrorCode =
+  | "invalid_schema"
+  | "unsupported_method"
+  | "unsupported_schema_version"
+  | "missing_required_tag"
+  | "missing_required_param"
+  | "invalid_signature"
+  | "unauthorized_controller"
+  | "misaddressed_request"
+  | "stale_request"
+  | "duplicate_conflict"
+  | "spec_hash_mismatch"
+  | "runtime_unavailable"
+  | "execution_failed"
+  | "publish_failed";
 
 export type SoulFactoryValidationCode =
   | "invalid_schema"
@@ -80,6 +97,21 @@ export interface ValidatedSoulFactoryRequest {
   specHash: string;
 }
 
+export type SoulFactoryExecutionStatus = "success" | "rejected" | "failed";
+
+export interface SoulFactoryExecutionError {
+  code: SoulFactoryResultErrorCode;
+  message: string;
+  retryable: boolean;
+  details?: Record<string, unknown>;
+}
+
+export interface SoulFactoryExecutionOutcome {
+  status: SoulFactoryExecutionStatus;
+  result?: Record<string, unknown>;
+  error?: SoulFactoryExecutionError | null;
+}
+
 export type SoulFactoryValidationResult =
   | { ok: true; request: ValidatedSoulFactoryRequest }
   | {
@@ -89,9 +121,13 @@ export type SoulFactoryValidationResult =
       details?: Record<string, unknown>;
     };
 
+export type SoulFactoryRequestStateMutation = "complete" | "pending" | "none";
+
 export interface SoulFactoryRequestValidationState {
   seenEventIds: Set<string>;
   idempotencyKeys: Map<string, string>;
+  pendingEventIds: Set<string>;
+  pendingIdempotencyKeys: Map<string, string>;
 }
 
 export interface SoulFactoryBridgeStateStore {
@@ -123,6 +159,7 @@ export interface StartSoulFactoryBridgeOptions {
   pool?: SoulFactoryRelayPool;
   stateStore?: SoulFactoryBridgeStateStore;
   onValidatedRequest?: (request: ValidatedSoulFactoryRequest) => void | Promise<void>;
+  executeRequest?: (request: ValidatedSoulFactoryRequest) => Promise<SoulFactoryExecutionOutcome>;
   onRejectedRequest?: (
     event: Event,
     result: Exclude<SoulFactoryValidationResult, { ok: true }>,
@@ -130,6 +167,7 @@ export interface StartSoulFactoryBridgeOptions {
   onError?: (error: Error, context: string) => void;
   onEose?: (relays: string) => void;
   onClosed?: (reason: string) => void;
+  onResultPublished?: (params: { request: ValidatedSoulFactoryRequest; event: Event }) => void;
 }
 
 export interface SoulFactoryBridgeHandle {
@@ -333,6 +371,8 @@ export function createSoulFactoryRequestValidationState(
   return {
     seenEventIds: new Set(seed?.recentEventIds ?? []),
     idempotencyKeys: new Map(Object.entries(seed?.idempotencyKeys ?? {})),
+    pendingEventIds: new Set(),
+    pendingIdempotencyKeys: new Map(),
   };
 }
 
@@ -345,6 +385,69 @@ function serializeSoulFactoryRequestValidationState(
   };
 }
 
+function pruneSetToLimit<T>(set: Set<T>, limit: number): void {
+  while (set.size > limit) {
+    const first = set.values().next().value as T | undefined;
+    if (first === undefined) {
+      break;
+    }
+    set.delete(first);
+  }
+}
+
+function pruneMapToLimit<K, V>(map: Map<K, V>, limit: number): void {
+  while (map.size > limit) {
+    const first = map.keys().next().value as K | undefined;
+    if (first === undefined) {
+      break;
+    }
+    map.delete(first);
+  }
+}
+
+function markSoulFactoryRequestState(
+  state: SoulFactoryRequestValidationState,
+  request: ValidatedSoulFactoryRequest,
+  fingerprint: string,
+  mutation: SoulFactoryRequestStateMutation,
+): void {
+  if (mutation === "pending") {
+    state.pendingEventIds.add(request.event.id);
+    state.pendingIdempotencyKeys.set(request.idempotencyKey, fingerprint);
+    pruneSetToLimit(state.pendingEventIds, MAX_PERSISTED_REQUESTS);
+    pruneMapToLimit(state.pendingIdempotencyKeys, MAX_PERSISTED_REQUESTS);
+    return;
+  }
+
+  state.seenEventIds.add(request.event.id);
+  state.idempotencyKeys.set(request.idempotencyKey, fingerprint);
+  state.pendingEventIds.delete(request.event.id);
+  state.pendingIdempotencyKeys.delete(request.idempotencyKey);
+  pruneSetToLimit(state.seenEventIds, MAX_PERSISTED_REQUESTS);
+  pruneMapToLimit(state.idempotencyKeys, MAX_PERSISTED_REQUESTS);
+}
+
+function rollbackSoulFactoryPendingRequest(
+  state: SoulFactoryRequestValidationState,
+  request: ValidatedSoulFactoryRequest,
+): void {
+  state.pendingEventIds.delete(request.event.id);
+  state.pendingIdempotencyKeys.delete(request.idempotencyKey);
+}
+
+function completeSoulFactoryRequestState(
+  state: SoulFactoryRequestValidationState,
+  request: ValidatedSoulFactoryRequest,
+): void {
+  const fingerprint = requestFingerprint({
+    event: request.event,
+    envelope: request.envelope,
+    operatorRequestEvent: request.operatorRequestEvent,
+    specHash: request.specHash,
+  });
+  markSoulFactoryRequestState(state, request, fingerprint, "complete");
+}
+
 export function validateSoulFactoryControlRequest(params: {
   event: Event;
   runtimePubkey: string;
@@ -353,6 +456,7 @@ export function validateSoulFactoryControlRequest(params: {
   staleRequestSeconds?: number;
   futureSkewSeconds?: number;
   state?: SoulFactoryRequestValidationState;
+  stateMutation?: SoulFactoryRequestStateMutation;
 }): SoulFactoryValidationResult {
   const { event, runtimePubkey } = params;
   const now = params.now ?? Math.floor(Date.now() / 1000);
@@ -360,7 +464,7 @@ export function validateSoulFactoryControlRequest(params: {
   const futureSkewSeconds = params.futureSkewSeconds ?? DEFAULT_FUTURE_SKEW_SECONDS;
   const trusted = new Set(normalizeControllerPubkeys(params.trustedControllerPubkeys));
 
-  if (params.state?.seenEventIds.has(event.id)) {
+  if (params.state?.seenEventIds.has(event.id) || params.state?.pendingEventIds.has(event.id)) {
     return reject("duplicate_conflict", "duplicate request event", { event_id: event.id });
   }
   if (event.kind !== SOULFACTORY_CONTROL_REQUEST_KIND) {
@@ -481,27 +585,32 @@ export function validateSoulFactoryControlRequest(params: {
 
   const fingerprint = requestFingerprint({ event, envelope, operatorRequestEvent, specHash });
   const priorFingerprint = params.state?.idempotencyKeys.get(idempotencyKey);
-  if (priorFingerprint) {
+  const pendingFingerprint = params.state?.pendingIdempotencyKeys.get(idempotencyKey);
+  if (priorFingerprint || pendingFingerprint) {
     return reject("duplicate_conflict", "idempotency key was already used", {
       idempotency_key: idempotencyKey,
     });
   }
 
-  params.state?.seenEventIds.add(event.id);
-  params.state?.idempotencyKeys.set(idempotencyKey, fingerprint);
+  const request: ValidatedSoulFactoryRequest = {
+    event,
+    envelope,
+    method: envelope.method,
+    idempotencyKey,
+    operatorRequestEvent,
+    soul: tagValue(event, "soul") ?? "",
+    agentId,
+    specHash,
+  };
+
+  const mutation = params.stateMutation ?? "complete";
+  if (params.state && mutation !== "none") {
+    markSoulFactoryRequestState(params.state, request, fingerprint, mutation);
+  }
 
   return {
     ok: true,
-    request: {
-      event,
-      envelope,
-      method: envelope.method,
-      idempotencyKey,
-      operatorRequestEvent,
-      soul: tagValue(event, "soul") ?? "",
-      agentId,
-      specHash,
-    },
+    request,
   };
 }
 
@@ -541,6 +650,142 @@ export function createSoulFactoryCapabilityEvent(params: {
     },
     sk,
   );
+}
+
+export function createSoulFactoryResultEvent(params: {
+  privateKey: string;
+  request: ValidatedSoulFactoryRequest;
+  outcome: SoulFactoryExecutionOutcome;
+  createdAt?: number;
+}): Event {
+  const sk = validatePrivateKey(params.privateKey);
+  const status = params.outcome.status;
+  const error = params.outcome.error ?? null;
+  const content = {
+    schema: SOULFACTORY_CONTROL_SCHEMA,
+    method: params.request.method,
+    idempotency_key: params.request.idempotencyKey,
+    request_event: params.request.event.id,
+    operator_request_event: params.request.operatorRequestEvent,
+    status,
+    result: status === "success" ? (params.outcome.result ?? {}) : (params.outcome.result ?? null),
+    error,
+  };
+  return finalizeEvent(
+    {
+      kind: SOULFACTORY_CONTROL_RESULT_KIND,
+      content: JSON.stringify(content),
+      tags: [
+        ["p", params.request.event.pubkey],
+        ["e", params.request.event.id],
+        ["method", params.request.method],
+        ["idempotency-key", params.request.idempotencyKey],
+        ["agent-id", params.request.agentId],
+        ["soul", params.request.soul],
+        ["spec-hash", params.request.specHash],
+        ["schema", SOULFACTORY_CONTROL_SCHEMA],
+        ["status", status],
+      ],
+      created_at: params.createdAt ?? Math.floor(Date.now() / 1000),
+    },
+    sk,
+  );
+}
+
+function pushTag(tags: string[][], name: string, value: string | undefined): void {
+  if (value) {
+    tags.push([name, value]);
+  }
+}
+
+function createSoulFactoryRejectedResultEvent(params: {
+  privateKey: string;
+  event: Event;
+  result: Exclude<SoulFactoryValidationResult, { ok: true }>;
+  createdAt?: number;
+}): Event {
+  const sk = validatePrivateKey(params.privateKey);
+  const method = tagValue(params.event, "method") ?? "unknown";
+  const idempotencyKey = tagValue(params.event, "idempotency-key") ?? "";
+  const operatorRequestEvent = tagValue(params.event, "e") ?? "";
+  const error: SoulFactoryExecutionError = {
+    code: params.result.code,
+    message: params.result.message,
+    retryable: false,
+    details: params.result.details,
+  };
+  const content = {
+    schema: SOULFACTORY_CONTROL_SCHEMA,
+    method,
+    idempotency_key: idempotencyKey,
+    request_event: params.event.id,
+    operator_request_event: operatorRequestEvent,
+    status: "rejected" as const,
+    result: null,
+    error,
+  };
+  const tags: string[][] = [
+    ["p", params.event.pubkey],
+    ["e", params.event.id],
+    ["method", method],
+    ["schema", SOULFACTORY_CONTROL_SCHEMA],
+    ["status", "rejected"],
+  ];
+  pushTag(tags, "idempotency-key", idempotencyKey);
+  pushTag(tags, "agent-id", tagValue(params.event, "agent-id"));
+  pushTag(tags, "soul", tagValue(params.event, "soul"));
+  pushTag(tags, "spec-hash", tagValue(params.event, "spec-hash"));
+
+  return finalizeEvent(
+    {
+      kind: SOULFACTORY_CONTROL_RESULT_KIND,
+      content: JSON.stringify(content),
+      tags,
+      created_at: params.createdAt ?? Math.floor(Date.now() / 1000),
+    },
+    sk,
+  );
+}
+
+function canPublishRejectedResult(params: { event: Event; runtimePubkey: string }): boolean {
+  if (params.event.kind !== SOULFACTORY_CONTROL_REQUEST_KIND) {
+    return false;
+  }
+  if (!params.event.id || !params.event.sig || !verifyEvent(params.event)) {
+    return false;
+  }
+  return tagValue(params.event, "p") === params.runtimePubkey;
+}
+
+async function publishEventToAnyRelay(params: {
+  pool: SoulFactoryRelayPool;
+  relays: string[];
+  event: Event;
+  purpose: string;
+}): Promise<{ successes: string[]; failures: Array<{ relay: string; error: string }> }> {
+  const successes: string[] = [];
+  const failures: Array<{ relay: string; error: string }> = [];
+
+  await Promise.all(
+    params.relays.map(async (relay) => {
+      try {
+        const [publishPromise] = [...params.pool.publish([relay], params.event)];
+        if (!publishPromise) {
+          throw new Error(`Failed to create publish promise for relay ${relay}`);
+        }
+        await publishPromise;
+        successes.push(relay);
+      } catch (error) {
+        failures.push({ relay, error: formatErrorMessage(error) });
+      }
+    }),
+  );
+
+  if (successes.length === 0) {
+    throw new Error(`${params.purpose} publish failed on all relays: ${JSON.stringify(failures)}`);
+  }
+
+  return { successes, failures };
 }
 
 async function publishCapability(params: {
@@ -620,21 +865,82 @@ export async function startSoulFactoryBridge(
           trustedControllerPubkeys,
           staleRequestSeconds,
           state,
+          stateMutation: "pending",
         });
         if (!result.ok) {
           options.onRejectedRequest?.(event, result);
+          if (canPublishRejectedResult({ event, runtimePubkey })) {
+            try {
+              const rejectedEvent = createSoulFactoryRejectedResultEvent({
+                privateKey: options.privateKey,
+                event,
+                result,
+              });
+              await publishEventToAnyRelay({
+                pool,
+                relays: options.relays,
+                event: rejectedEvent,
+                purpose: "SoulFactory rejected result",
+              });
+            } catch (error) {
+              options.onError?.(error as Error, "soulfactory rejected result publish");
+            }
+          }
           return;
         }
         try {
+          await options.onValidatedRequest?.(result.request);
+        } catch (error) {
+          options.onError?.(error as Error, "soulfactory validated request callback");
+        }
+        if (!options.executeRequest) {
+          completeSoulFactoryRequestState(state, result.request);
+          try {
+            await stateStore.write({
+              accountId: options.accountId,
+              state: serializeSoulFactoryRequestValidationState(state),
+            });
+          } catch (error) {
+            options.onError?.(error as Error, "soulfactory persist state");
+          }
+          return;
+        }
+        let outcome: SoulFactoryExecutionOutcome;
+        try {
+          outcome = await options.executeRequest(result.request);
+        } catch (error) {
+          outcome = {
+            status: "failed",
+            error: {
+              code: "execution_failed",
+              message: formatErrorMessage(error),
+              retryable: true,
+            },
+          };
+        }
+        const resultEvent = createSoulFactoryResultEvent({
+          privateKey: options.privateKey,
+          request: result.request,
+          outcome,
+        });
+        try {
+          await publishEventToAnyRelay({
+            pool,
+            relays: options.relays,
+            event: resultEvent,
+            purpose: "SoulFactory result",
+          });
+          completeSoulFactoryRequestState(state, result.request);
           await stateStore.write({
             accountId: options.accountId,
             state: serializeSoulFactoryRequestValidationState(state),
           });
         } catch (error) {
-          options.onError?.(error as Error, "soulfactory persist state");
+          rollbackSoulFactoryPendingRequest(state, result.request);
+          options.onError?.(error as Error, "soulfactory result publish or persist");
           return;
         }
-        await options.onValidatedRequest?.(result.request);
+        options.onResultPublished?.({ request: result.request, event: resultEvent });
       },
       oneose: () => options.onEose?.(options.relays.join(", ")),
       onclose: (reason) => {

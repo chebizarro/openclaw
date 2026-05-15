@@ -92,6 +92,10 @@
       "types": "./dist/src/plugin-sdk/cron-store-runtime.d.ts",
       "default": "./src/cron-store-runtime.ts"
     },
+    "./sessions-spawn-runtime": {
+      "types": "./dist/src/plugin-sdk/sessions-spawn-runtime.d.ts",
+      "default": "./src/sessions-spawn-runtime.ts"
+    },
     "./channel-secret-runtime": {
       "types": "./dist/src/plugin-sdk/channel-secret-runtime.d.ts",
       "default": "./src/channel-secret-runtime.ts"

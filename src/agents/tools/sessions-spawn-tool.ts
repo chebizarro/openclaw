@@ -4,20 +4,12 @@ import {
   resolveThreadBindingSpawnPolicy,
   supportsAutomaticThreadBindingSpawn,
 } from "../../channels/thread-bindings-policy.js";
-import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { callGateway } from "../../gateway/call.js";
-import { createLazyImportLoader } from "../../shared/lazy-promise.js";
-import { normalizeDeliveryContext } from "../../utils/delivery-context.shared.js";
 import type { GatewayMessageChannel } from "../../utils/message-channel.js";
 import { optionalStringEnum } from "../schema/typebox.js";
+import { spawnSessionDirect, type SpawnSessionContext } from "../sessions-spawn-orchestrator.js";
 import type { SpawnedToolContext } from "../spawned-context.js";
-import { registerSubagentRun } from "../subagent-registry.js";
-import {
-  SUBAGENT_SPAWN_CONTEXT_MODES,
-  SUBAGENT_SPAWN_MODES,
-  spawnSubagentDirect,
-} from "../subagent-spawn.js";
+import { SUBAGENT_SPAWN_CONTEXT_MODES, SUBAGENT_SPAWN_MODES } from "../subagent-spawn.js";
 import { normalizeSubagentTaskName } from "../subagent-task-name.js";
 import {
   describeSessionsSpawnTool,
@@ -31,11 +23,6 @@ import {
   readStringParam,
   ToolInputError,
 } from "./common.js";
-import {
-  resolveDisplaySessionKey,
-  resolveInternalSessionKey,
-  resolveMainSessionAlias,
-} from "./sessions-helpers.js";
 
 const SESSIONS_SPAWN_RUNTIMES = ["subagent", "acp"] as const;
 const SESSIONS_SPAWN_SANDBOX_MODES = ["inherit", "require"] as const;
@@ -51,66 +38,6 @@ const UNSUPPORTED_SESSIONS_SPAWN_PARAM_KEYS = [
   "replyTo",
   "reply_to",
 ] as const;
-
-type AcpSpawnModule = typeof import("../acp-spawn.js");
-
-const acpSpawnModuleLoader = createLazyImportLoader<AcpSpawnModule>(
-  () => import("../acp-spawn.js"),
-);
-
-async function loadAcpSpawnModule(): Promise<AcpSpawnModule> {
-  return await acpSpawnModuleLoader.load();
-}
-
-function summarizeError(err: unknown): string {
-  if (err instanceof Error) {
-    return err.message;
-  }
-  if (typeof err === "string") {
-    return err;
-  }
-  return "error";
-}
-
-function addRoleToFailureResult<T extends { status: string }>(
-  result: T,
-  role: string | undefined,
-): T | (T & { role: string }) {
-  if (!role || (result.status !== "error" && result.status !== "forbidden")) {
-    return result;
-  }
-  return { ...result, role };
-}
-
-function resolveTrackedSpawnMode(params: {
-  requestedMode?: "run" | "session";
-  threadRequested: boolean;
-}): "run" | "session" {
-  if (params.requestedMode === "run" || params.requestedMode === "session") {
-    return params.requestedMode;
-  }
-  return params.threadRequested ? "session" : "run";
-}
-
-async function cleanupUntrackedAcpSession(sessionKey: string): Promise<void> {
-  const key = sessionKey.trim();
-  if (!key) {
-    return;
-  }
-  try {
-    await callGateway({
-      method: "sessions.delete",
-      params: {
-        key,
-        deleteTranscript: true,
-        emitLifecycleHooks: false,
-      },
-      timeoutMs: 10_000,
-    });
-  } catch {
-    // Best-effort cleanup only.
-  }
-}
 
 type SessionsSpawnThreadAvailability = {
   subagent: boolean;
@@ -232,16 +159,6 @@ function createSessionsSpawnToolSchema(params: {
   return Type.Object(schema);
 }
 
-function resolveAcpUnavailableMessage(opts?: { sandboxed?: boolean; config?: OpenClawConfig }) {
-  if (opts?.sandboxed === true) {
-    return 'runtime="acp" is unavailable from sandboxed sessions because ACP sessions run on the host. Use runtime="subagent".';
-  }
-  if (opts?.config?.acp?.enabled === false) {
-    return 'runtime="acp" is unavailable because ACP is disabled by policy (`acp.enabled=false`). Use runtime="subagent".';
-  }
-  return 'runtime="acp" is unavailable in this session because no ACP runtime backend is loaded. Enable the acpx plugin or use runtime="subagent".';
-}
-
 export function createSessionsSpawnTool(
   opts?: {
     agentSessionKey?: string;
@@ -304,20 +221,6 @@ export function createSessionsSpawnTool(
         params.context === "fork" || params.context === "isolated" ? params.context : undefined;
       const streamTo = runtime === "acp" && params.streamTo === "parent" ? "parent" : undefined;
       const lightContext = params.lightContext === true;
-      const roleContext = requestedAgentId ? { role: requestedAgentId } : {};
-      if (runtime === "acp" && !acpAvailable) {
-        return jsonResult({
-          status: "error",
-          error: resolveAcpUnavailableMessage(opts),
-          ...roleContext,
-        });
-      }
-      if (runtime === "acp" && lightContext) {
-        throw new Error("lightContext is only supported for runtime='subagent'.");
-      }
-      if (runtime === "acp" && context === "fork") {
-        throw new Error('context="fork" is only supported for runtime="subagent".');
-      }
       // Back-compat: older callers used timeoutSeconds for this tool.
       const timeoutSecondsCandidate =
         typeof params.runTimeoutSeconds === "number"
@@ -338,132 +241,33 @@ export function createSessionsSpawnTool(
             mimeType?: string;
           }>)
         : undefined;
+      const attachMountPath =
+        params.attachAs && typeof params.attachAs === "object"
+          ? readStringParam(params.attachAs as Record<string, unknown>, "mountPath")
+          : undefined;
 
-      if (runtime === "acp") {
-        const { isSpawnAcpAcceptedResult, spawnAcpDirect } = await loadAcpSpawnModule();
-        if (Array.isArray(attachments) && attachments.length > 0) {
-          return jsonResult({
-            status: "error",
-            error:
-              "attachments are currently unsupported for runtime=acp; use runtime=subagent or remove attachments",
-            ...roleContext,
-          });
-        }
-        const result = await spawnAcpDirect(
-          {
-            task,
-            label: label || undefined,
-            agentId: requestedAgentId,
-            resumeSessionId,
-            model: modelOverride,
-            thinking: thinkingOverrideRaw,
-            runTimeoutSeconds,
-            cwd,
-            mode: mode === "run" || mode === "session" ? mode : undefined,
-            thread,
-            sandbox,
-            streamTo,
-          },
-          {
-            agentSessionKey: opts?.agentSessionKey,
-            agentChannel: opts?.agentChannel,
-            agentAccountId: opts?.agentAccountId,
-            agentTo: opts?.agentTo,
-            agentThreadId: opts?.agentThreadId,
-            agentGroupId: opts?.agentGroupId ?? undefined,
-            agentGroupSpace: opts?.agentGroupSpace,
-            agentMemberRoleIds: opts?.agentMemberRoleIds,
-            sandboxed: opts?.sandboxed,
-          },
-        );
-        const childSessionKey = result.childSessionKey?.trim();
-        const childRunId = isSpawnAcpAcceptedResult(result) ? result.runId?.trim() : undefined;
-        const shouldTrackViaRegistry =
-          result.status === "accepted" &&
-          Boolean(childSessionKey) &&
-          Boolean(childRunId) &&
-          streamTo !== "parent";
-        if (shouldTrackViaRegistry && childSessionKey && childRunId) {
-          const cfg = getRuntimeConfig();
-          const trackedSpawnMode = resolveTrackedSpawnMode({
-            requestedMode: result.mode,
-            threadRequested: thread,
-          });
-          const trackedCleanup = trackedSpawnMode === "session" ? "keep" : cleanup;
-          const { mainKey, alias } = resolveMainSessionAlias(cfg);
-          const requesterInternalKey = opts?.agentSessionKey
-            ? resolveInternalSessionKey({
-                key: opts.agentSessionKey,
-                alias,
-                mainKey,
-              })
-            : alias;
-          const requesterDisplayKey = resolveDisplaySessionKey({
-            key: requesterInternalKey,
-            alias,
-            mainKey,
-          });
-          const requesterOrigin = normalizeDeliveryContext({
-            channel: opts?.agentChannel,
-            accountId: opts?.agentAccountId,
-            to: opts?.agentTo,
-            threadId: opts?.agentThreadId,
-          });
-          const shouldExpectCompletionMessage = result.inlineDelivery
-            ? false
-            : expectsCompletionMessage;
-          try {
-            registerSubagentRun({
-              runId: childRunId,
-              childSessionKey,
-              requesterSessionKey: requesterInternalKey,
-              requesterOrigin,
-              requesterDisplayKey,
-              task,
-              taskName,
-              cleanup: trackedCleanup,
-              label: label || undefined,
-              runTimeoutSeconds,
-              expectsCompletionMessage: shouldExpectCompletionMessage,
-              spawnMode: trackedSpawnMode,
-            });
-          } catch (err) {
-            // Best-effort only: the ACP turn was already started above, so deleting the
-            // child session record here does not guarantee the in-flight run was aborted.
-            await cleanupUntrackedAcpSession(childSessionKey);
-            return jsonResult({
-              status: "error",
-              error: `Failed to register ACP run: ${summarizeError(err)}. Cleanup was attempted, but the already-started ACP run may still finish in the background.`,
-              childSessionKey,
-              runId: childRunId,
-              ...roleContext,
-            });
-          }
-        }
-        return jsonResult(addRoleToFailureResult(result, requestedAgentId));
-      }
-
-      const result = await spawnSubagentDirect(
+      const { runtime: _spawnRuntime, ...result } = await spawnSessionDirect(
         {
+          runtime,
           task,
           taskName,
           label: label || undefined,
           agentId: requestedAgentId,
+          resumeSessionId,
           model: modelOverride,
           thinking: thinkingOverrideRaw,
           runTimeoutSeconds,
-          thread,
+          cwd,
           mode,
           cleanup,
           sandbox,
           context,
+          streamTo,
+          thread,
           lightContext,
           expectsCompletionMessage,
           attachments,
-          attachMountPath:
-            params.attachAs && typeof params.attachAs === "object"
-              ? readStringParam(params.attachAs as Record<string, unknown>, "mountPath")
-              : undefined,
+          attachMountPath,
         },
         {
           agentSessionKey: opts?.agentSessionKey,
@@ -477,10 +281,12 @@ export function createSessionsSpawnTool(
           agentMemberRoleIds: opts?.agentMemberRoleIds,
           requesterAgentIdOverride: opts?.requesterAgentIdOverride,
           workspaceDir: opts?.workspaceDir,
-        },
+          sandboxed: opts?.sandboxed,
+          config: opts?.config,
+        } satisfies SpawnSessionContext,
       );
 
-      return jsonResult(addRoleToFailureResult(result, requestedAgentId));
+      return jsonResult(result);
     },
   };
 }

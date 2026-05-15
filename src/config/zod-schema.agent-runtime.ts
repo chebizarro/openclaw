@@ -876,6 +876,35 @@ const AgentRuntimeSchema = z
   ])
   .optional();
 
+const AgentSoulFactorySchema = z
+  .object({
+    managed: z.boolean().optional(),
+    soulId: z.string().optional(),
+    soulEvent: z.string().optional(),
+    soulDraft: z.string().optional(),
+    ownerPubkey: z.string().optional(),
+    controllerPubkey: z.string().optional(),
+    runtimePubkey: z.string().optional(),
+    capabilityRef: z.string().optional(),
+    controlRelays: z.array(z.string()).optional(),
+    specHash: z.string().optional(),
+    lastOperatorRequestEvent: z.string().optional(),
+    lastRuntimeRequestEvent: z.string().optional(),
+    runtimeBinding: z.string().optional(),
+    state: z.enum(["running", "suspended", "revoked", "failed"]).optional(),
+    session: z
+      .object({
+        key: z.string().optional(),
+        runId: z.string().optional(),
+        spawnedAt: z.number().int().nonnegative().optional(),
+      })
+      .strict()
+      .optional(),
+    updatedAt: z.number().int().nonnegative().optional(),
+  })
+  .strict()
+  .optional();
+
 export const AgentEmbeddedHarnessSchema = z
   .object({
     runtime: z.string().optional(),
@@ -961,6 +990,7 @@ export const AgentEntrySchema = z
     params: z.record(z.string(), z.unknown()).optional(),
     tools: AgentToolsSchema,
     runtime: AgentRuntimeSchema,
+    soulFactory: AgentSoulFactorySchema,
   })
   .strict();
 

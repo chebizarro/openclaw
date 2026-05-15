@@ -11,6 +11,7 @@ import { startNostrBus, type NostrBusHandle } from "./nostr-bus.js";
 import { normalizePubkey } from "./nostr-key-utils.js";
 import { getNostrRuntime } from "./runtime.js";
 import { startSoulFactoryBridge, type SoulFactoryBridgeHandle } from "./soulfactory-bridge.js";
+import { executeSoulFactoryRuntimeRequest } from "./soulfactory-execution.js";
 import { resolveDefaultNostrAccountId, type ResolvedNostrAccount } from "./types.js";
 
 type NostrGatewayStart = NonNullable<
@@ -254,7 +255,13 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
         config: account.soulFactory,
         onValidatedRequest: (request) => {
           ctx.log?.info?.(
-            `[${account.accountId}] validated SoulFactory ${request.method} request ${request.event.id} for agent ${request.agentId}; execution is not enabled in this bridge slice`,
+            `[${account.accountId}] executing SoulFactory ${request.method} request ${request.event.id} for agent ${request.agentId}`,
+          );
+        },
+        executeRequest: executeSoulFactoryRuntimeRequest,
+        onResultPublished: ({ request, event }) => {
+          ctx.log?.info?.(
+            `[${account.accountId}] published SoulFactory result ${event.id} for ${request.method} request ${request.event.id}`,
           );
         },
         onRejectedRequest: (event, result) => {
