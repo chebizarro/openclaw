@@ -6,6 +6,28 @@ import {
 import { buildSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
 import { z } from "zod";
 
+export const SoulFactoryBridgeConfigSchema = z.object({
+  /** Enable OpenClaw SoulFactory runtime capability/control bridge. */
+  enabled: z.boolean().optional(),
+
+  /** Trusted SoulFactory controller pubkeys allowed to sign runtime control requests. */
+  controllerPubkeys: z.array(z.string()).optional(),
+
+  /** Reject runtime control requests older than this many seconds. */
+  staleRequestSeconds: z.number().int().positive().optional(),
+
+  /** Relay hints advertised in the 30317 runtime capability announcement. */
+  relayHints: z
+    .object({
+      read: z.array(z.string()).optional(),
+      write: z.array(z.string()).optional(),
+      control: z.array(z.string()).optional(),
+    })
+    .optional(),
+});
+
+export type SoulFactoryBridgeConfig = z.infer<typeof SoulFactoryBridgeConfigSchema>;
+
 /**
  * Validates https:// URLs only (no javascript:, data:, file:, etc.)
  */
@@ -95,4 +117,7 @@ export const NostrConfigSchema = z.object({
 
   /** Profile metadata (NIP-01 kind:0 content) */
   profile: NostrProfileSchema.optional(),
+
+  /** SoulFactory runtime capability/control bridge configuration. */
+  soulFactory: SoulFactoryBridgeConfigSchema.optional(),
 });

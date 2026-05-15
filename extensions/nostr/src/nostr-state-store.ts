@@ -7,6 +7,7 @@ import { getNostrRuntime } from "./runtime.js";
 
 const STORE_VERSION = 2;
 const PROFILE_STATE_VERSION = 1;
+const SOULFACTORY_BRIDGE_STATE_VERSION = 1;
 
 type NostrBusState = {
   version: 2;
@@ -27,6 +28,12 @@ type NostrProfileState = {
   lastPublishedEventId: string | null;
   /** Per-relay publish results from last attempt */
   lastPublishResults: Record<string, "ok" | "failed" | "timeout"> | null;
+};
+
+export type NostrSoulFactoryBridgeState = {
+  version: 1;
+  recentEventIds: string[];
+  idempotencyKeys: Record<string, string>;
 };
 
 const NullableFiniteNumberSchema = z.number().finite().nullable().catch(null);
@@ -56,6 +63,15 @@ const NostrProfileStateSchema = z.object({
     .catch(null),
 });
 
+const NostrSoulFactoryBridgeStateSchema = z.object({
+  version: z.literal(1),
+  recentEventIds: z
+    .array(z.unknown())
+    .catch([])
+    .transform((ids) => ids.filter((id): id is string => typeof id === "string")),
+  idempotencyKeys: z.record(z.string(), z.string()).catch({}),
+});
+
 function normalizeAccountId(accountId?: string): string {
   const trimmed = accountId?.trim();
   if (!trimmed) {
@@ -77,6 +93,15 @@ function resolveNostrProfileStatePath(
   const stateDir = getNostrRuntime().state.resolveStateDir(env, os.homedir);
   const normalized = normalizeAccountId(accountId);
   return path.join(stateDir, "nostr", `profile-state-${normalized}.json`);
+}
+
+function resolveNostrSoulFactoryBridgeStatePath(
+  accountId?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const stateDir = getNostrRuntime().state.resolveStateDir(env, os.homedir);
+  const normalized = normalizeAccountId(accountId);
+  return path.join(stateDir, "nostr", `soulfactory-bridge-state-${normalized}.json`);
 }
 
 function safeParseState(raw: string): NostrBusState | null {
@@ -199,6 +224,45 @@ export async function writeNostrProfileState(params: {
     lastPublishedAt: params.lastPublishedAt,
     lastPublishedEventId: params.lastPublishedEventId,
     lastPublishResults: params.lastPublishResults,
+  };
+  await privateFileStore(path.dirname(filePath)).writeJson(path.basename(filePath), payload, {
+    trailingNewline: true,
+  });
+}
+
+export async function readNostrSoulFactoryBridgeState(params: {
+  accountId?: string;
+  env?: NodeJS.ProcessEnv;
+}): Promise<NostrSoulFactoryBridgeState | null> {
+  const filePath = resolveNostrSoulFactoryBridgeStatePath(params.accountId, params.env);
+  try {
+    const raw = await privateFileStore(path.dirname(filePath)).readTextIfExists(
+      path.basename(filePath),
+    );
+    if (raw === null) {
+      return null;
+    }
+    return safeParseJsonWithSchema(NostrSoulFactoryBridgeStateSchema, raw);
+  } catch {
+    return null;
+  }
+}
+
+export async function writeNostrSoulFactoryBridgeState(params: {
+  accountId?: string;
+  state: Omit<NostrSoulFactoryBridgeState, "version">;
+  env?: NodeJS.ProcessEnv;
+}): Promise<void> {
+  const filePath = resolveNostrSoulFactoryBridgeStatePath(params.accountId, params.env);
+  const payload: NostrSoulFactoryBridgeState = {
+    version: SOULFACTORY_BRIDGE_STATE_VERSION,
+    recentEventIds: params.state.recentEventIds.filter((x): x is string => typeof x === "string"),
+    idempotencyKeys: Object.fromEntries(
+      Object.entries(params.state.idempotencyKeys).filter(
+        (entry): entry is [string, string] =>
+          typeof entry[0] === "string" && typeof entry[1] === "string",
+      ),
+    ),
   };
   await privateFileStore(path.dirname(filePath)).writeJson(path.basename(filePath), payload, {
     trailingNewline: true,

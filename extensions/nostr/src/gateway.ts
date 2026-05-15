@@ -10,6 +10,7 @@ import type { MetricEvent, MetricsSnapshot } from "./metrics.js";
 import { startNostrBus, type NostrBusHandle } from "./nostr-bus.js";
 import { normalizePubkey } from "./nostr-key-utils.js";
 import { getNostrRuntime } from "./runtime.js";
+import { startSoulFactoryBridge, type SoulFactoryBridgeHandle } from "./soulfactory-bridge.js";
 import { resolveDefaultNostrAccountId, type ResolvedNostrAccount } from "./types.js";
 
 type NostrGatewayStart = NonNullable<
@@ -110,6 +111,7 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
     });
 
   let busHandle: NostrBusHandle | null = null;
+  let soulFactoryBridge: SoulFactoryBridgeHandle | null = null;
 
   const authorizeSender = async (input: {
     senderId: string;
@@ -243,12 +245,55 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
   busHandle = bus;
   activeBuses.set(account.accountId, bus);
 
+  try {
+    if (account.soulFactory?.enabled) {
+      soulFactoryBridge = await startSoulFactoryBridge({
+        accountId: account.accountId,
+        privateKey: account.privateKey,
+        relays: account.relays,
+        config: account.soulFactory,
+        onValidatedRequest: (request) => {
+          ctx.log?.info?.(
+            `[${account.accountId}] validated SoulFactory ${request.method} request ${request.event.id} for agent ${request.agentId}; execution is not enabled in this bridge slice`,
+          );
+        },
+        onRejectedRequest: (event, result) => {
+          ctx.log?.debug?.(
+            `[${account.accountId}] rejected SoulFactory control request ${event.id}: ${result.code} ${result.message}`,
+          );
+        },
+        onEose: (relays) => {
+          ctx.log?.debug?.(
+            `[${account.accountId}] SoulFactory EOSE received from relays: ${relays}`,
+          );
+        },
+        onClosed: (reason) => {
+          ctx.log?.warn?.(`[${account.accountId}] SoulFactory subscription closed: ${reason}`);
+        },
+        onError: (error, context) => {
+          ctx.log?.error?.(
+            `[${account.accountId}] SoulFactory bridge error (${context}): ${error.message}`,
+          );
+        },
+      });
+      ctx.log?.info?.(
+        `[${account.accountId}] SoulFactory OpenClaw capability published as ${soulFactoryBridge.capability.eventId}`,
+      );
+    }
+  } catch (error) {
+    bus.close();
+    activeBuses.delete(account.accountId);
+    metricsSnapshots.delete(account.accountId);
+    throw error;
+  }
+
   ctx.log?.info?.(
     `[${account.accountId}] Nostr provider started, connected to ${account.relays.length} relay(s)`,
   );
 
   return {
     stop: () => {
+      soulFactoryBridge?.close();
       bus.close();
       activeBuses.delete(account.accountId);
       metricsSnapshots.delete(account.accountId);
